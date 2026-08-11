@@ -1,18 +1,17 @@
 #!/usr/bin/env bash
 # ==============================================================================
 # 3x-ui One-Click Installer
-# Supports:
-#   1) Fresh VPS deployment  (init system, hardening, BBR, firewall, swap)
-#   2) Clean overwrite       (wipes old x-ui / 3x-ui / v2-ui / xray-ui / s-ui)
+# One command automatically covers both cases:
+#   - New VPS:      auto init system (packages, firewall, BBR, swap) and install
+#   - Old VPS:      auto detect and wipe old x-ui/3x-ui/v2-ui/etc. then reinstall
 #
 # Hard-coded defaults (override via flags):
 #   username=admin   password=123456   port=10601   webpath=/xui
 #   node-port=443    HTTPS via self-signed cert (Let's Encrypt if -d <domain> given)
 #
 # Usage:
-#   bash install.sh                       # fresh VPS, IP-only self-signed
-#   bash install.sh --force-clean         # clean reinstall on old VPS
-#   bash install.sh -d xui.example.com    # with domain + Let's Encrypt
+#   bash install.sh                 # works on new or old VPS automatically
+#   bash install.sh -d domain.com   # optional: Let's Encrypt domain cert
 # ==============================================================================
 set -euo pipefail
 
@@ -42,13 +41,13 @@ step()  { echo -e "\n${BLU}==> $*${RST}"; }
 usage() {
   cat <<EOF
 Usage: $0 [options]
-  -d, --domain DOMAIN     Domain for HTTPS (Let's Encrypt)
+  -d, --domain DOMAIN     Domain for HTTPS panel (recommended)
   -p, --port PORT         Panel port        (default: $XUI_PORT)
   -u, --username USER     Panel username    (default: $XUI_USERNAME)
   -P, --password PASS     Panel password    (default: $XUI_PASSWORD)
   -b, --basepath PATH     Web base path     (default: $XUI_WEBBASEPATH)
   -n, --nodeport PORT     Node inbound port (default: $XUI_NODEPORT)
-  --force-clean           Wipe old x-ui/3x-ui/v2-ui/etc. before install
+  --force-clean           Optional: force wipe even if no old panel is detected
   --no-init               Skip VPS initialization
   --selfsigned            Use self-signed certificate (default when no -d)
   -h, --help              Show help
@@ -117,6 +116,29 @@ pkg_update() {
 }
 
 # ---------- Clean old panels ----------
+# Returns 0 if any old proxy panel is detected on this server.
+detect_old_install() {
+  local svc d
+  for svc in x-ui 3x-ui xray-ui v2-ui s-ui h-ui m-ui marzban marzbanny; do
+    if systemctl list-unit-files 2>/dev/null | grep -q "^${svc}\\.service"; then
+      return 0
+    fi
+  done
+  for d in /usr/local/x-ui /etc/x-ui /usr/local/3x-ui /etc/3x-ui \
+           /usr/local/v2-ui /etc/v2-ui /usr/local/xray-ui /etc/xray-ui \
+           /usr/local/s-ui /etc/s-ui /usr/local/h-ui; do
+    if [[ -d "$d" ]]; then
+      return 0
+    fi
+  done
+  for svc in x-ui 3x-ui xray-ui v2-ui; do
+    if command -v "$svc" &>/dev/null; then
+      return 0
+    fi
+  done
+  return 1
+}
+
 clean_old_panels() {
   step "Wiping old proxy panels and residual files"
 
@@ -312,4 +334,216 @@ generate_selfsigned() {
   # Build SAN list with public IP + common private IPs + localhost
   SAN="IP:127.0.0.1"
   [[ -n "$IP" ]] && SAN="${SAN},IP:${IP}"
-  for p in $(hostname -
+  for p in $(hostname -I 2>/dev/null); do
+    [[ "$p" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] && SAN="${SAN},IP:${p}"
+  done
+
+  openssl req -x509 -newkey rsa:2048 -sha256 -days 3650 -nodes \
+    -keyout "$KEY_FILE" -out "$CRT_FILE" \
+    -subj "/CN=$CN" \
+    -addext "subjectAltName = ${SAN}" \
+    -addext "extendedKeyUsage = serverAuth" \
+    >/dev/null 2>&1
+  CERT_MODE="selfsigned"
+  info "Self-signed cert created in $CERT_DIR (CN=$CN, SAN=$SAN)"
+}
+
+issue_letsencrypt() {
+  step "Issuing Let's Encrypt certificate for $XUI_DOMAIN"
+  mkdir -p "$CERT_DIR"
+
+  # free port 80
+  systemctl stop nginx 2>/dev/null || true
+  systemctl stop caddy 2>/dev/null || true
+  systemctl stop 3x-ui 2>/dev/null || true
+  sleep 2
+
+  # install acme.sh if missing
+  if [[ ! -d /root/.acme.sh ]]; then
+    info "Installing acme.sh..."
+    if ! curl -sSL https://get.acme.sh | sh -s email="$EMAIL" >/tmp/acme-install.log 2>&1; then
+      warn "acme.sh install failed; falling back to self-signed."
+      generate_selfsigned
+      systemctl restart 3x-ui 2>/dev/null || true
+      return
+    fi
+  fi
+
+  # shellcheck disable=SC1091
+  source /root/.acme.sh/acme.sh
+  /root/.acme.sh/acme.sh --set-default-ca --server letsencrypt
+
+  if /root/.acme.sh/acme.sh --issue -d "$XUI_DOMAIN" --standalone --keylength ec-256 \
+       --cert-file "$CRT_FILE" --key-file "$KEY_FILE" --fullchain-file "$CRT_FILE" \
+       --force >/tmp/acme-issue.log 2>&1; then
+    /root/.acme.sh/acme.sh --install-cert -d "$XUI_DOMAIN" --ecc \
+      --cert-file "$CRT_FILE" --key-file "$KEY_FILE" --fullchain-file "$CRT_FILE" \
+      --reloadcmd "systemctl restart 3x-ui" >/dev/null 2>&1 || true
+    CERT_MODE="letsencrypt"
+    info "Let's Encrypt cert issued for $XUI_DOMAIN"
+  else
+    warn "Let's Encrypt failed (DNS or port 80 issue). Falling back to self-signed."
+    generate_selfsigned
+  fi
+  systemctl restart 3x-ui 2>/dev/null || true
+}
+
+enable_tls_in_panel() {
+  step "Enabling HTTPS in panel"
+  [[ -f "$CRT_FILE" && -f "$KEY_FILE" ]] || { error "Certificate files missing"; exit 1; }
+  3x-ui setting -cert "$CRT_FILE" -certKey "$KEY_FILE"
+  systemctl restart 3x-ui
+  sleep 2
+}
+
+# ---------- Default VLESS+REALITY inbound ----------
+create_default_inbound() {
+  step "Creating default VLESS+REALITY inbound on port $XUI_NODEPORT"
+
+  # detect public IP
+  local PUBLIC_IP
+  PUBLIC_IP="$(get_public_ip)"
+  [[ -z "$PUBLIC_IP" ]] && PUBLIC_IP="YOUR_SERVER_IP"
+  info "Public IP: $PUBLIC_IP"
+
+  # UUID
+  local UUID
+  UUID=$(cat /proc/sys/kernel/random/uuid)
+
+  # x25519 keys via bundled xray
+  local XRAY_BIN PRIV_KEY PUB_KEY
+  XRAY_BIN=$(find /usr/local/x-ui -maxdepth 4 -name 'xray-linux-*' -type f 2>/dev/null | head -1)
+  if [[ -n "$XRAY_BIN" && -x "$XRAY_BIN" ]]; then
+    KPS=$("$XRAY_BIN" x25519 2>/dev/null || true)
+    PRIV_KEY=$(echo "$KPS" | awk '/Private key:/{print $3}')
+    PUB_KEY=$(echo "$KPS" | awk '/Public key:/{print $3}')
+  fi
+
+  local SID
+  SID=$(openssl rand -hex 8)
+
+  if [[ -z "${PRIV_KEY:-}" || -z "${PUB_KEY:-}" ]]; then
+    PRIV_KEY="REPLACE_ME_RERUN_XRAY_X25519"
+    PUB_KEY="REPLACE_ME_RERUN_XRAY_X25519"
+    warn "Could not generate x25519 keys. Generate them in the panel after install."
+  fi
+
+  # Insert into sqlite DB using a heredoc to avoid quoting hell
+  local DB="/etc/3x-ui/3x-ui.db"
+  if [[ -f "$DB" ]] && command -v sqlite3 &>/dev/null; then
+    local TAG="vless-reality-${XUI_NODEPORT}"
+    local SETTINGS STREAM SNIFFING ALLOCATE
+    SETTINGS=$(jq -cn --arg uuid "$UUID" \
+      '{clients:[],decryption:"none",fallbacks:[]}')
+    STREAM=$(jq -cn --arg sid "$SID" --arg pk "$PRIV_KEY" \
+      '{network:"tcp",security:"reality",
+        realitySettings:{show:false,xver:0,dest:"www.microsoft.com:443",
+          serverNames:["www.microsoft.com","microsoft.com"],
+          privateKey:$pk,minClient:"",maxClient:"",maxTimediff:0,
+          shortIds:[$sid],
+          settings:{publicKey:"",fingerprint:"chrome",serverName:"",spiderX:"/"}}}')
+    SNIFFING='{"enabled":true,"destOverride":["http","tls","quic","fakedns"],"metadataOnly":false}'
+    ALLOCATE='{"strategy":"always","refresh":5,"concurrency":3}'
+
+    sqlite3 "$DB" <<SQL
+DELETE FROM inbounds WHERE port=${XUI_NODEPORT} OR tag='${TAG}';
+INSERT INTO inbounds (user_id,up,down,total,remark,enable,expiry_time,listen,port,protocol,settings,stream_settings,tag,sniffing,allocate)
+VALUES (1,0,0,0,'VLESS-REALITY-${XUI_NODEPORT}',1,0,'',${XUI_NODEPORT},'vless',
+  '$(echo "$SETTINGS" | sed "s/'/''/g")',
+  '$(echo "$STREAM" | sed "s/'/''/g")',
+  '${TAG}',
+  '${SNIFFING}',
+  '${ALLOCATE}');
+SQL
+    systemctl restart 3x-ui
+    sleep 2
+    info "Default inbound created."
+  else
+    warn "sqlite3 not available or DB missing; skipping default inbound. Add in panel."
+  fi
+
+  # Write link file
+  local HOST FPATH PANEL_URL
+  HOST="${XUI_DOMAIN:-$PUBLIC_IP}"
+  FPATH="/${XUI_WEBBASEPATH}"
+  [[ "$FPATH" == "/" ]] && FPATH=""
+  PANEL_URL="https://${HOST}:${XUI_PORT}${FPATH}/"
+
+  mkdir -p /root
+  cat > /root/xui-link.txt <<EOF
+==============================================
+ 3x-ui Panel Information
+==============================================
+Panel URL : ${PANEL_URL}
+Username  : ${XUI_USERNAME}
+Password  : ${XUI_PASSWORD}
+TLS Mode  : ${CERT_MODE}
+----------------------------------------------
+Default Inbound: VLESS + REALITY
+  Port      : ${XUI_NODEPORT}
+  UUID      : ${UUID}
+  PublicKey : ${PUB_KEY}
+  ShortID   : ${SID}
+  Server    : ${HOST}
+  SNI       : www.microsoft.com
+  Fingerprint: chrome
+==============================================
+EOF
+  chmod 600 /root/xui-link.txt
+  info "Saved info to /root/xui-link.txt"
+}
+
+# ---------- Banner & main ----------
+banner() {
+  cat <<'BANNER'
+
+   ____  _____     _
+  |___ \|  __ \   (_)
+    __) | |  | |_   _
+   |__ <| |  | \ \ / /
+   ___) | |__| |\ V /
+  |____/|_____/  \_/   One-Click Installer
+
+BANNER
+}
+
+main() {
+  banner
+  detect_os
+
+  if [[ $FORCE_CLEAN -eq 1 ]] || detect_old_install; then
+    info "Old proxy panel detected (or --force-clean given). Running clean reinstall."
+    clean_old_panels
+  else
+    info "No existing panel found. Running fresh VPS install."
+  fi
+
+  if [[ $FRESH_INIT -eq 1 ]]; then
+    vps_init
+  else
+    info "Skipping VPS initialization (--no-init)."
+  fi
+
+  install_3xui
+  configure_panel
+
+  # Issue certs: Let's Encrypt only if a domain is provided; otherwise self-signed for IP.
+  if [[ "$CERT_MODE" == "letsencrypt" && -n "$XUI_DOMAIN" ]]; then
+    issue_letsencrypt
+  else
+    generate_selfsigned
+  fi
+  enable_tls_in_panel
+  create_default_inbound
+
+  step "Installation complete!"
+  cat /root/xui-link.txt
+  echo
+  info "Useful commands:"
+  echo "  3x-ui              # open management menu"
+  echo "  3x-ui restart      # restart panel"
+  echo "  3x-ui status       # status"
+  echo "  cat /root/xui-link.txt"
+}
+
+main "$@"
