@@ -204,6 +204,8 @@ EOF
     ufw allow "${XUI_PORT}/tcp"
     ufw allow "${XUI_NODEPORT}/tcp"
     ufw allow "${XUI_NODEPORT}/udp"
+    ufw allow 2096/tcp
+    ufw allow 2096/udp
     echo "y" | ufw enable
   elif command -v firewall-cmd &>/dev/null; then
     systemctl enable --now firewalld
@@ -213,13 +215,16 @@ EOF
     firewall-cmd --permanent --add-port="${XUI_PORT}/tcp"
     firewall-cmd --permanent --add-port="${XUI_NODEPORT}/tcp"
     firewall-cmd --permanent --add-port="${XUI_NODEPORT}/udp"
+    firewall-cmd --permanent --add-port=2096/tcp
+    firewall-cmd --permanent --add-port=2096/udp
     firewall-cmd --permanent --add-masquerade
     firewall-cmd --reload
   else
-    for p in 22 80 443 "$XUI_PORT" "$XUI_NODEPORT"; do
+    for p in 22 80 443 "$XUI_PORT" "$XUI_NODEPORT" 2096; do
       iptables -I INPUT -p tcp --dport "$p" -j ACCEPT 2>/dev/null || true
     done
     iptables -I INPUT -p udp --dport "$XUI_NODEPORT" -j ACCEPT 2>/dev/null || true
+    iptables -I INPUT -p udp --dport 2096 -j ACCEPT 2>/dev/null || true
   fi
 
   if [[ ! -f /swapfile ]] && [[ $(free -m | awk '/^Swap:/{print $2}') -lt 1024 ]]; then
